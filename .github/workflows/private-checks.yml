@@ -1,0 +1,120 @@
+name: Manual isolated checks
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'linux by default; macOS requires prior owner confirmation'
+        required: true
+        type: choice
+        options: [linux, macos]
+        default: linux
+permissions: {}
+concurrency:
+  group: isolated-checks
+  cancel-in-progress: false
+jobs:
+  checks:
+    runs-on: ${{ inputs.platform == 'macos' && 'macos-15' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    steps:
+      - name: Prepare reviewed source privately
+        shell: bash
+        env:
+          READ_ONLY_KEY: ${{ secrets.LOCKNEXT_READONLY_DEPLOY_KEY }}
+          REVIEWED_COMMIT: ${{ secrets.LOCKNEXT_REVIEWED_COMMIT }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          private="$RUNNER_TEMP/locknext-private"
+          mkdir -p "$private"
+          # Never echo private diagnostics. Public status deliberately contains no source details.
+          exec 3>&1
+          exec >"$private/prepare.log" 2>&1
+          trap 'rc=$?; rm -f "$private/deploy_key"; if [ "$rc" -eq 0 ]; then echo "Source prepared." >&3; else echo "Source preparation failed; details withheld." >&3; fi' EXIT
+          (
+          exec 3>&-
+          test -n "$READ_ONLY_KEY"
+          [[ "$REVIEWED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          printf '%s\n' "$READ_ONLY_KEY" > "$private/deploy_key"
+          unset READ_ONLY_KEY
+          # GitHub's HTTPS metadata supplies pinned host keys, not unauthenticated ssh-keyscan.
+          python3 - "$private/known_hosts" <<'PY'
+          import json, sys, urllib.request
+          request = urllib.request.Request('https://api.github.com/meta', headers={'User-Agent': 'locknext-ci'})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              keys = json.load(response)['ssh_keys']
+          if not keys or any('\n' in key or '\r' in key for key in keys):
+              raise ValueError('Invalid host key metadata')
+          with open(sys.argv[1], 'w') as output:
+              for key in keys:
+                  output.write('github.com ' + key + '\n')
+          PY
+          export GIT_SSH_COMMAND="ssh -i $private/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$private/known_hosts"
+          git init -q "$private/source"
+          cd "$private/source"
+          git remote add origin git@github.com:zning1994/locknext.git
+          git fetch -q --depth=1 origin "$REVIEWED_COMMIT"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$REVIEWED_COMMIT"
+          rm -f "$private/deploy_key"
+          unset GIT_SSH_COMMAND REVIEWED_COMMIT
+          git remote remove origin
+          )
+      - name: Run checks with private output
+        shell: bash
+        env:
+          SELECTED_PLATFORM: ${{ inputs.platform }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          private="$RUNNER_TEMP/locknext-private"
+          exec 3>&1
+          exec >"$private/checks.log" 2>&1
+          trap 'rc=$?; if [ "$rc" -eq 0 ]; then echo "Selected functional checks passed." >&3; else echo "Selected functional checks failed; reproduce privately for diagnostics." >&3; fi' EXIT
+          (
+          exec 3>&-
+          cd "$private/source"
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s Integrations -p 'test_*.py'
+          python3 - <<'PY'
+          import json, pathlib, plistlib, subprocess
+          count = 0
+          def reject(value):
+              raise ValueError('Non-standard JSON')
+          for name in filter(None, subprocess.check_output(['git','ls-files','-z']).decode().split('\0')):
+              path = pathlib.Path(name)
+              if path.parts[0] not in {'App','MacApp','ShareExtension','Widgets','WatchApp'}:
+                  continue
+              if path.suffix in {'.plist','.xcprivacy','.entitlements'}:
+                  with path.open('rb') as source: plistlib.load(source)
+              elif path.suffix == '.json':
+                  with path.open(encoding='utf-8') as source: json.load(source, parse_constant=reject)
+              else:
+                  continue
+              count += 1
+          if not count: raise ValueError('No resources checked')
+          PY
+          if [ "$SELECTED_PLATFORM" = macos ]; then
+            xcrun simctl list devices available -j > "$private/devices.json"
+            simulator=$(python3 - "$private/devices.json" <<'PY'
+          import json,sys
+          devices=json.load(open(sys.argv[1]))['devices']
+          ids=[d['udid'] for runtime, values in sorted(devices.items(), reverse=True) if 'iOS' in runtime for d in values if d.get('isAvailable') and d['name'].startswith('iPhone')]
+          if not ids: raise SystemExit('No simulator')
+          print(ids[0])
+          PY
+            )
+            xcodebuild -project LockNext.xcodeproj -scheme LockNext -destination "platform=iOS Simulator,id=$simulator" -parallel-testing-enabled NO -collect-test-diagnostics never -derivedDataPath "$private/build" -resultBundlePath "$private/Functional.xcresult" CODE_SIGNING_ALLOWED=NO test
+            xcodebuild -project LockNext.xcodeproj -scheme LockNextMac -destination 'platform=macOS' -collect-test-diagnostics never -derivedDataPath "$private/build-mac" CODE_SIGNING_ALLOWED=NO test
+          fi
+          )
+      - name: Remove ephemeral private workspace
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set +x
+          if ! rm -rf -- "$RUNNER_TEMP/locknext-private" >/dev/null 2>&1; then
+            echo "Ephemeral cleanup failed; details withheld."
+            exit 1
+          fi
