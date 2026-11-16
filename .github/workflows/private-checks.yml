@@ -39,19 +39,10 @@ jobs:
           [[ "$REVIEWED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           printf '%s\n' "$READ_ONLY_KEY" > "$private/deploy_key"
           unset READ_ONLY_KEY
-          # GitHub's HTTPS metadata supplies pinned host keys, not unauthenticated ssh-keyscan.
+          # GitHub's public ED25519 host key pinned from official HTTPS metadata.
+          # Re-review against https://api.github.com/meta if GitHub rotates host keys.
           printf %s host-keys > "$private/phase"
-          python3 - "$private/known_hosts" <<'PY'
-          import json, sys, urllib.request
-          request = urllib.request.Request('https://api.github.com/meta', headers={'User-Agent': 'locknext-ci'})
-          with urllib.request.urlopen(request, timeout=30) as response:
-              keys = json.load(response)['ssh_keys']
-          if not keys or any('\n' in key or '\r' in key for key in keys):
-              raise ValueError('Invalid host key metadata')
-          with open(sys.argv[1], 'w') as output:
-              for key in keys:
-                  output.write('github.com ' + key + '\n')
-          PY
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$private/known_hosts"
           export GIT_SSH_COMMAND="ssh -i $private/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$private/known_hosts"
           git init -q "$private/source"
           cd "$private/source"
