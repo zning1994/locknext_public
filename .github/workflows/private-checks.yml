@@ -31,14 +31,16 @@ jobs:
           # Never echo private diagnostics. Public status deliberately contains no source details.
           exec 3>&1
           exec >"$private/prepare.log" 2>&1
-          trap 'rc=$?; rm -f "$private/deploy_key"; if [ "$rc" -eq 0 ]; then echo "Source prepared." >&3; else echo "Source preparation failed; details withheld." >&3; fi' EXIT
+          trap 'rc=$?; rm -f "$private/deploy_key"; if [ "$rc" -eq 0 ]; then echo "Source prepared." >&3; else phase=$(cat "$private/phase" 2>/dev/null || true); case "$phase" in inputs|host-keys|fetch|checkout|verify|remove-remote) echo "Source preparation failed at $phase; details withheld." >&3;; *) echo "Source preparation failed; details withheld." >&3;; esac; fi' EXIT
           (
           exec 3>&-
+          printf %s inputs > "$private/phase"
           test -n "$READ_ONLY_KEY"
           [[ "$REVIEWED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           printf '%s\n' "$READ_ONLY_KEY" > "$private/deploy_key"
           unset READ_ONLY_KEY
           # GitHub's HTTPS metadata supplies pinned host keys, not unauthenticated ssh-keyscan.
+          printf %s host-keys > "$private/phase"
           python3 - "$private/known_hosts" <<'PY'
           import json, sys, urllib.request
           request = urllib.request.Request('https://api.github.com/meta', headers={'User-Agent': 'locknext-ci'})
@@ -54,11 +56,15 @@ jobs:
           git init -q "$private/source"
           cd "$private/source"
           git remote add origin git@github.com:zning1994/locknext.git
+          printf %s fetch > "$private/phase"
           git fetch -q --depth=1 origin "$REVIEWED_COMMIT"
+          printf %s checkout > "$private/phase"
           git checkout -q --detach FETCH_HEAD
+          printf %s verify > "$private/phase"
           test "$(git rev-parse HEAD)" = "$REVIEWED_COMMIT"
           rm -f "$private/deploy_key"
           unset GIT_SSH_COMMAND REVIEWED_COMMIT
+          printf %s remove-remote > "$private/phase"
           git remote remove origin
           )
       - name: Run checks with private output
